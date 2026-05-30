@@ -69,6 +69,11 @@ pub enum DataKey {
     BudgetFreeze(Address),
     SpendingWindow(Address),
     SuspiciousActivityCount,
+    Budget(Address),
+    BudgetAsset(Address, Address),
+    UserAssets(Address),
+    TotalAllocated,
+    PendingDeletion(Address),
 }
 
 pub fn get_user_budget(env: &Env, user: &Address) -> Option<UserBudget> {

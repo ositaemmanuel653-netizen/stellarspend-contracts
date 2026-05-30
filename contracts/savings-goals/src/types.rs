@@ -221,6 +221,8 @@ pub enum DataKey {
     GoalMilestonesPercent(u64),
     /// Total milestones achieved lifetime
     TotalMilestonesAchieved,
+    /// Maps (user, goal_name) -> goal_id for duplicate detection
+    GoalByName(Address, Symbol),
 }
 
 /// Error codes for goal validation and creation.
@@ -247,12 +249,14 @@ pub mod ErrorCode {
     pub const UNAUTHORIZED_USER: u32 = 8;
     /// Goal has already achieved this milestone
     pub const MILESTONE_ALREADY_ACHIEVED: u32 = 9;
+    /// Duplicate goal name for the same user
+    pub const DUPLICATE_GOAL_NAME: u32 = 11;
     /// Goal is locked; withdrawals not yet allowed
-    pub const GOAL_LOCKED: u32 = 11;
+    pub const GOAL_LOCKED: u32 = 12;
     /// Withdrawal amount exceeds current balance
-    pub const INSUFFICIENT_BALANCE: u32 = 12;
+    pub const INSUFFICIENT_BALANCE: u32 = 13;
     /// Invalid withdrawal or contribution amount
-    pub const INVALID_WITHDRAW_AMOUNT: u32 = 13;
+    pub const INVALID_WITHDRAW_AMOUNT: u32 = 14;
 }
 
 /// Events emitted by the savings goals contract.
@@ -321,6 +325,7 @@ impl GoalEvents {
             ),
         );
     }
+
     /// Event emitted when a milestone percentage is achieved automatically.
     pub fn milestone_achieved_percent(env: &Env, goal_id: u64, milestone_percent: u32) {
         let topics = (symbol_short!("milestone"), symbol_short!("auto"), goal_id);
@@ -366,5 +371,25 @@ impl GoalEvents {
         let topics = (symbol_short!("milestone"), symbol_short!("done"));
         env.events()
             .publish(topics, (batch_id, successful, failed, total_percentage));
+    }
+
+    /// Event emitted when a partial withdrawal is made from a goal.
+    pub fn partial_withdrawal(
+        env: &Env,
+        goal_id: u64,
+        user: &Address,
+        amount: i128,
+        remaining: i128,
+    ) {
+        let topics = (symbol_short!("goal"), symbol_short!("withdraw"));
+        env.events()
+            .publish(topics, (goal_id, user.clone(), amount, remaining));
+    }
+
+    /// Event emitted when a goal is renamed.
+    pub fn goal_renamed(env: &Env, goal_id: u64, old_name: &Symbol, new_name: &Symbol) {
+        let topics = (symbol_short!("goal"), symbol_short!("renamed"), goal_id);
+        env.events()
+            .publish(topics, (old_name.clone(), new_name.clone()));
     }
 }

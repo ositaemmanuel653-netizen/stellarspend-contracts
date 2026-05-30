@@ -463,6 +463,82 @@ fn test_zero_initial_contribution() {
 }
 
 #[test]
+fn test_duplicate_goal_name_same_user() {
+    let (env, admin, client) = setup_test_contract();
+    let user = Address::generate(&env);
+
+    let mut requests: Vec<SavingsGoalRequest> = Vec::new(&env);
+    requests.push_back(create_valid_request(&env, &user, "vacation", 100_000_000));
+    requests.push_back(create_valid_request(&env, &user, "vacation", 200_000_000)); // Duplicate name
+
+    let result = client.batch_set_savings_goals(&admin, &requests);
+
+    assert_eq!(result.total_requests, 2);
+    assert_eq!(result.successful, 1); // First one succeeds
+    assert_eq!(result.failed, 1); // Second one fails (duplicate name)
+
+    // Verify first succeeded
+    match &result.results.get(0).unwrap() {
+        GoalResult::Success(_) => {}
+        GoalResult::Failure(_, _) => panic!("Expected first request to succeed"),
+    }
+
+    // Verify second failed with duplicate error
+    match &result.results.get(1).unwrap() {
+        GoalResult::Success(_) => panic!("Expected second request to fail"),
+        GoalResult::Failure(_, error_code) => {
+            assert_eq!(*error_code, ErrorCode::DUPLICATE_GOAL_NAME);
+        }
+    }
+
+    assert_eq!(client.get_total_goals_created(), 1);
+}
+
+#[test]
+fn test_same_goal_name_different_users() {
+    let (env, admin, client) = setup_test_contract();
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+
+    let mut requests: Vec<SavingsGoalRequest> = Vec::new(&env);
+    requests.push_back(create_valid_request(&env, &user1, "vacation", 100_000_000));
+    requests.push_back(create_valid_request(&env, &user2, "vacation", 200_000_000)); // Same name, different user
+
+    let result = client.batch_set_savings_goals(&admin, &requests);
+
+    assert_eq!(result.total_requests, 2);
+    assert_eq!(result.successful, 2); // Both should succeed
+    assert_eq!(result.failed, 0);
+    assert_eq!(client.get_total_goals_created(), 2);
+}
+
+#[test]
+fn test_duplicate_goal_name_across_batches() {
+    let (env, admin, client) = setup_test_contract();
+    let user = Address::generate(&env);
+
+    // First batch creates "vacation"
+    let mut requests1: Vec<SavingsGoalRequest> = Vec::new(&env);
+    requests1.push_back(create_valid_request(&env, &user, "vacation", 100_000_000));
+    let result1 = client.batch_set_savings_goals(&admin, &requests1);
+    assert_eq!(result1.successful, 1);
+
+    // Second batch tries to create "vacation" again for same user
+    let mut requests2: Vec<SavingsGoalRequest> = Vec::new(&env);
+    requests2.push_back(create_valid_request(&env, &user, "vacation", 200_000_000));
+    let result2 = client.batch_set_savings_goals(&admin, &requests2);
+    assert_eq!(result2.successful, 0);
+    assert_eq!(result2.failed, 1);
+
+    match &result2.results.get(0).unwrap() {
+        GoalResult::Failure(_, error_code) => {
+            assert_eq!(*error_code, ErrorCode::DUPLICATE_GOAL_NAME);
+        }
+        GoalResult::Success(_) => panic!("Expected duplicate to fail"),
+    }
+}
+
+#[test]
 fn test_full_initial_contribution() {
     let (env, admin, client) = setup_test_contract();
     let user = Address::generate(&env);

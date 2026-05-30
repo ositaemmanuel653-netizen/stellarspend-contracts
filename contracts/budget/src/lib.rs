@@ -1,7 +1,8 @@
 //! # Budget Contract
 //!
 //! Manages per-user category budgets with category-to-category transfers,
-//! transfer history, and suspicious spending protection.
+//! transfer history, suspicious spending protection, multi-asset budgets,
+//! and deletion cooldown.
 
 #![no_std]
 
@@ -10,7 +11,8 @@ mod storage;
 mod test;
 
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, Address, Env, Map, Symbol, Vec,
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, Env, Map,
+    Symbol, Vec,
 };
 
 pub use storage::{
@@ -20,10 +22,13 @@ pub use storage::{
 
 use storage::{
     clear_budget_freeze, get_budget_freeze, get_category_available, get_transfer,
-    get_user_budget, get_user_transfers, increment_suspicious_count, is_budget_frozen,
-    next_transfer_id, record_spend_timestamp, record_transfer, set_budget_freeze,
-    set_user_budget,
+    get_user_budget as load_user_budget, get_user_transfers, increment_suspicious_count,
+    is_budget_frozen, next_transfer_id, record_spend_timestamp, record_transfer,
+    set_budget_freeze, set_user_budget,
 };
+
+/// Deletion cooldown period in seconds (24 hours).
+pub const DELETION_COOLDOWN_SECONDS: u64 = 86_400;
 
 /// Error codes for the budget contract.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -32,18 +37,39 @@ pub enum BudgetError {
     NotInitialized = 1,
     Unauthorized = 2,
     InvalidAmount = 3,
-    BudgetNotFound = 4,
-    CategoryNotFound = 5,
-    InsufficientBalance = 6,
-    SameCategory = 7,
-    BudgetFrozen = 8,
-    SuspiciousActivity = 9,
+    UserNotFound = 4,
+    DeletionCooldownNotElapsed = 5,
+    NoPendingDeletion = 6,
+    BudgetNotFound = 7,
+    CategoryNotFound = 8,
+    InsufficientBalance = 9,
+    SameCategory = 10,
+    BudgetFrozen = 11,
+    SuspiciousActivity = 12,
 }
 
 impl From<BudgetError> for soroban_sdk::Error {
     fn from(e: BudgetError) -> Self {
         soroban_sdk::Error::from_contract_error(e as u32)
     }
+}
+
+/// Budget record for a user with multi-asset support.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct BudgetRecord {
+    pub user: Address,
+    pub amount: i128,
+    pub asset: Option<Address>,
+    pub last_updated: u64,
+}
+
+/// Pending deletion record with cooldown expiry timestamp.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PendingDeletion {
+    pub user: Address,
+    pub cooldown_expiry: u64,
 }
 
 /// Events emitted by the budget contract.
@@ -114,6 +140,78 @@ impl BudgetContract {
         env.storage()
             .instance()
             .set(&DataKey::SuspiciousActivityCount, &0u64);
+        env.storage().instance().set(&DataKey::TotalAllocated, &0i128);
+    }
+
+    /// Updates a single user's budget with optional multi-asset support.
+    pub fn update_budget(
+        env: Env,
+        admin: Address,
+        user: Address,
+        amount: i128,
+        asset: Option<Address>,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        if amount <= 0 {
+            panic_with_error!(&env, BudgetError::InvalidAmount);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut total_allocated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalAllocated)
+            .unwrap_or(0);
+
+        if let Some(old_record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BudgetRecord>(&DataKey::Budget(user.clone()))
+        {
+            total_allocated = total_allocated.checked_sub(old_record.amount).unwrap_or(0);
+        }
+
+        total_allocated = total_allocated.checked_add(amount).unwrap_or(i128::MAX);
+
+        let record = BudgetRecord {
+            user: user.clone(),
+            amount,
+            asset: asset.clone(),
+            last_updated: current_time,
+        };
+
+        if let Some(ref asset_addr) = asset {
+            env.storage().persistent().set(
+                &DataKey::BudgetAsset(user.clone(), asset_addr.clone()),
+                &record,
+            );
+            let mut user_assets: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserAssets(user.clone()))
+                .unwrap_or(Vec::new(&env));
+            if !user_assets.contains(asset_addr) {
+                user_assets.push_back(asset_addr.clone());
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::UserAssets(user.clone()), &user_assets);
+            }
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Budget(user.clone()), &record);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAllocated, &total_allocated);
+
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("updated")),
+            (user, amount, current_time),
+        );
     }
 
     /// Sets or updates a category budget limit for a user.
@@ -132,7 +230,7 @@ impl BudgetContract {
         }
 
         let now = env.ledger().timestamp();
-        let mut budget = get_user_budget(&env, &user).unwrap_or(UserBudget {
+        let mut budget = load_user_budget(&env, &user).unwrap_or(UserBudget {
             user: user.clone(),
             categories: Map::new(&env),
             last_updated: now,
@@ -176,7 +274,7 @@ impl BudgetContract {
             panic_with_error!(&env, BudgetError::SameCategory);
         }
 
-        let mut budget = get_user_budget(&env, &user).unwrap_or_else(|| {
+        let mut budget = load_user_budget(&env, &user).unwrap_or_else(|| {
             panic_with_error!(&env, BudgetError::BudgetNotFound);
         });
 
@@ -245,7 +343,7 @@ impl BudgetContract {
         }
 
         let now = env.ledger().timestamp();
-        let mut budget = get_user_budget(&env, &user).unwrap_or_else(|| {
+        let mut budget = load_user_budget(&env, &user).unwrap_or_else(|| {
             panic_with_error!(&env, BudgetError::BudgetNotFound);
         });
 
@@ -297,9 +395,136 @@ impl BudgetContract {
         }
     }
 
+    /// Schedules a budget for deletion with a 24-hour cooldown.
+    pub fn schedule_deletion(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, BudgetRecord>(&DataKey::Budget(user.clone()))
+            .is_none()
+        {
+            panic_with_error!(&env, BudgetError::UserNotFound);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let cooldown_expiry = current_time
+            .checked_add(DELETION_COOLDOWN_SECONDS)
+            .unwrap_or(u64::MAX);
+
+        let pending = PendingDeletion {
+            user: user.clone(),
+            cooldown_expiry,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingDeletion(user.clone()), &pending);
+
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("del_sched")),
+            (user, cooldown_expiry),
+        );
+    }
+
+    /// Cancels a pending budget deletion.
+    pub fn cancel_deletion(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingDeletion(user.clone()))
+        {
+            panic_with_error!(&env, BudgetError::NoPendingDeletion);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingDeletion(user.clone()));
+
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("del_canc")),
+            user,
+        );
+    }
+
+    /// Executes a scheduled budget deletion after the cooldown period has elapsed.
+    pub fn execute_deletion(env: Env, admin: Address, user: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let pending: PendingDeletion = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingDeletion(user.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, BudgetError::NoPendingDeletion));
+
+        let current_time = env.ledger().timestamp();
+        if current_time < pending.cooldown_expiry {
+            panic_with_error!(&env, BudgetError::DeletionCooldownNotElapsed);
+        }
+
+        let mut old_amount = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BudgetRecord>(&DataKey::Budget(user.clone()))
+            .map(|r| r.amount)
+            .unwrap_or(0);
+
+        let user_assets: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user.clone()))
+            .unwrap_or(Vec::new(&env));
+        for asset in user_assets.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BudgetRecord>(&DataKey::BudgetAsset(
+                    user.clone(),
+                    asset.clone(),
+                ))
+            {
+                old_amount = old_amount.checked_add(record.amount).unwrap_or(old_amount);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::BudgetAsset(user.clone(), asset.clone()));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UserAssets(user.clone()));
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Budget(user.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingDeletion(user.clone()));
+
+        let total_allocated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalAllocated)
+            .unwrap_or(0);
+        let new_total = total_allocated.checked_sub(old_amount).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAllocated, &new_total);
+
+        env.events().publish(
+            (symbol_short!("budget"), symbol_short!("deleted")),
+            (user, current_time),
+        );
+    }
+
     /// Returns remaining balance for a category (limit - spent).
     pub fn get_category_balance(env: Env, user: Address, category: Symbol) -> i128 {
-        let budget = get_user_budget(&env, &user).unwrap_or_else(|| {
+        let budget = load_user_budget(&env, &user).unwrap_or_else(|| {
             panic_with_error!(&env, BudgetError::BudgetNotFound);
         });
         let cat = budget
@@ -309,9 +534,9 @@ impl BudgetContract {
         get_category_available(&cat)
     }
 
-    /// Returns a user's full budget configuration.
+    /// Returns a user's full category budget configuration.
     pub fn get_user_budget(env: Env, user: Address) -> UserBudget {
-        get_user_budget(&env, &user).unwrap_or_else(|| {
+        load_user_budget(&env, &user).unwrap_or_else(|| {
             panic_with_error!(&env, BudgetError::BudgetNotFound);
         })
     }
@@ -346,12 +571,47 @@ impl BudgetContract {
             .unwrap_or(0)
     }
 
+    /// Returns the pending deletion for a user, if one exists.
+    pub fn get_pending_deletion(env: Env, user: Address) -> Option<PendingDeletion> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingDeletion(user))
+    }
+
+    /// Retrieves the budget for a specific user (default/native asset).
+    pub fn get_budget(env: Env, user: Address) -> Option<BudgetRecord> {
+        env.storage().persistent().get(&DataKey::Budget(user))
+    }
+
+    /// Retrieves the budget for a specific user and asset.
+    pub fn get_budget_by_asset(env: Env, user: Address, asset: Address) -> Option<BudgetRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BudgetAsset(user, asset))
+    }
+
+    /// Returns all asset contract IDs for a user's multi-asset budgets.
+    pub fn get_user_assets(env: Env, user: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Returns the admin address.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("Not initialized")
+    }
+
+    /// Returns the total allocated budget amount.
+    pub fn get_total_allocated(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalAllocated)
+            .unwrap_or(0)
     }
 
     fn freeze_for_suspicious_activity(env: &Env, user: &Address, now: u64) {

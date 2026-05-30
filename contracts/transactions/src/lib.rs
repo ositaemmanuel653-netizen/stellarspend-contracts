@@ -71,6 +71,7 @@ impl TransactionsContract {
         memo: String,
         tags: Vec<String>,
         tx_type: Symbol,
+        is_public: bool,
     ) -> Symbol {
         from.require_auth();
         
@@ -91,8 +92,7 @@ impl TransactionsContract {
             panic_with_error!(&env, TransactionError::DuplicateTransaction);
         }
 
-        
-        let transaction = create_transaction(&env, from.clone(), to, amount, note, memo, tags, tx_type);
+        let transaction = create_transaction(&env, from.clone(), to, amount, note, memo, tags, tx_type, is_public);
         
         env.events().publish(
             (symbol_short!("tx"), symbol_short!("created")),
@@ -201,7 +201,6 @@ impl TransactionsContract {
         
         success
     }
-    
     /// Update the amount for a transaction (only transaction owner can update)
     pub fn update_transaction_amount(env: Env, id: Symbol, caller: Address, amount: i128) -> bool {
         caller.require_auth();
@@ -230,7 +229,6 @@ impl TransactionsContract {
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
-    
     /// Get the timestamp of a transaction
     pub fn get_transaction_timestamp(env: Env, id: Symbol) -> Option<u64> {
         get_transaction_timestamp(&env, id)
@@ -255,6 +253,7 @@ impl TransactionsContract {
     pub fn get_user_transactions_filtered(env: Env, user: Address, tx_type: Symbol) -> Vec<Transaction> {
         storage::get_user_transactions_filtered(&env, user, tx_type)
     }
+
 
     /// Check if a transaction exists
     pub fn transaction_exists(env: Env, id: Symbol) -> bool {

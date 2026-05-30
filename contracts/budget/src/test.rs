@@ -54,7 +54,7 @@ fn test_transfer_between_categories() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #9)")]
 fn test_transfer_insufficient_balance() {
     let (_, admin, user, client) = setup();
     let (food, travel) = setup_categories(&client, &admin, &user);
@@ -62,7 +62,7 @@ fn test_transfer_insufficient_balance() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #7)")]
+#[should_panic(expected = "Error(Contract, #10)")]
 fn test_transfer_same_category() {
     let (_, admin, user, client) = setup();
     let (food, _) = setup_categories(&client, &admin, &user);
@@ -80,7 +80,7 @@ fn test_spend_and_remaining_balance() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #11)")]
 fn test_rapid_spending_triggers_freeze() {
     let (_, admin, user, client) = setup();
     let (food, _) = setup_categories(&client, &admin, &user);
@@ -92,7 +92,7 @@ fn test_rapid_spending_triggers_freeze() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #11)")]
 fn test_frozen_budget_blocks_transfer() {
     let (_, admin, user, client) = setup();
     let (food, travel) = setup_categories(&client, &admin, &user);
