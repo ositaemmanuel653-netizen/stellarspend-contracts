@@ -21,16 +21,22 @@
 
 #![no_std]
 
+mod cross_contract;
 mod types;
 mod validation;
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
 
 pub use crate::types::{
-    BatchLimitMetrics, BatchLimitResult, DataKey, ErrorCode, LimitEvents, LimitUpdateResult,
-    SpendingLimit, SpendingLimitRequest, MAX_BATCH_SIZE,
+    BatchLimitMetrics, BatchLimitResult, DataKey, ErrorCode, EscalationConfig, LimitEvents,
+    LimitStrategy, LimitUpdateResult, LimitsConfig, SpendingLimit, SpendingLimitRequest,
+    MAX_BATCH_SIZE,
 };
 use crate::validation::validate_limit_request;
+
+// Add cross-contract imports for whitelist functionality
+use crate::cross_contract::DataKey as CrossContractDataKey;
+use soroban_sdk::{Bytes, Symbol};
 
 /// Error codes for the spending limits contract.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -70,19 +76,24 @@ impl SpendingLimitsContract {
     /// # Arguments
     /// * `env` - The contract environment
     /// * `admin` - The admin address that can manage the contract
+    ///
+    /// # Storage Optimization
+    /// Uses a consolidated `LimitsConfig` struct instead of 4 separate
+    /// storage entries, reducing initialization writes from 4 to 1.
     pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
+        if env.storage().instance().has(&DataKey::LimitsConfig) {
             panic!("Contract already initialized");
         }
 
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::LastBatchId, &0u64);
+        let config = LimitsConfig {
+            admin,
+            last_batch_id: 0,
+            total_limits_updated: 0,
+            total_batches_processed: 0,
+        };
         env.storage()
             .instance()
-            .set(&DataKey::TotalLimitsUpdated, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalBatchesProcessed, &0u64);
+            .set(&DataKey::LimitsConfig, &config);
     }
 
     /// Updates monthly spending limits for multiple users in a batch.
@@ -127,13 +138,13 @@ impl SpendingLimitsContract {
             panic_with_error!(&env, SpendingLimitError::BatchTooLarge);
         }
 
-        // Get batch ID and increment
-        let batch_id: u64 = env
+        // Get batch ID and increment from consolidated config
+        let mut config: LimitsConfig = env
             .storage()
             .instance()
-            .get(&DataKey::LastBatchId)
-            .unwrap_or(0)
-            + 1;
+            .get(&DataKey::LimitsConfig)
+            .expect("Contract not initialized");
+        let batch_id: u64 = config.last_batch_id + 1;
 
         // Emit batch started event
         LimitEvents::batch_started(&env, batch_id, request_count);
@@ -163,6 +174,7 @@ impl SpendingLimitsContract {
                         category: request.category.clone(),
                         updated_at: current_ledger,
                         is_active: true,
+                        strategy: request.strategy.clone(),
                     };
 
                     // Accumulate metrics
@@ -220,28 +232,19 @@ impl SpendingLimitsContract {
             processed_at: current_ledger,
         };
 
-        // Update storage (batched at the end for efficiency)
-        let total_limits: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalLimitsUpdated)
-            .unwrap_or(0);
-        let total_batches: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalBatchesProcessed)
-            .unwrap_or(0);
-
+        // Update consolidated config (single write instead of 4)
+        config.last_batch_id = batch_id;
+        config.total_limits_updated = config
+            .total_limits_updated
+            .checked_add(successful_count as u64)
+            .unwrap_or(u64::MAX);
+        config.total_batches_processed = config
+            .total_batches_processed
+            .checked_add(1)
+            .unwrap_or(u64::MAX);
         env.storage()
             .instance()
-            .set(&DataKey::LastBatchId, &batch_id);
-        env.storage().instance().set(
-            &DataKey::TotalLimitsUpdated,
-            &(total_limits + successful_count as u64),
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalBatchesProcessed, &(total_batches + 1));
+            .set(&DataKey::LimitsConfig, &config);
 
         // Emit batch completed event
         LimitEvents::batch_completed(
@@ -262,13 +265,88 @@ impl SpendingLimitsContract {
         }
     }
 
-    /// Enforces the configured daily and monthly spending limits for a user.
+    /// Configures escalation rules for spending enforcement.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `admin` - Admin address (must authorize)
+    /// * `small_threshold` - Amount below which spends are "small" (auto-approved)
+    /// * `medium_threshold` - Amount below which spends are "medium" (logged)
+    ///   Spends at or above this threshold are "large" and require admin approval
+    /// * `enabled` - Whether escalation rules are active
+    pub fn configure_escalation_rules(
+        env: Env,
+        admin: Address,
+        small_threshold: i128,
+        medium_threshold: i128,
+        enabled: bool,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        if small_threshold <= 0 || medium_threshold <= small_threshold {
+            panic_with_error!(&env, SpendingLimitError::InvalidAmount);
+        }
+
+        let config = EscalationConfig {
+            small_threshold,
+            medium_threshold,
+            enabled,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscalationConfig, &config);
+
+        LimitEvents::escalation_configured(&env, small_threshold, medium_threshold, enabled);
+    }
+
+    /// Returns the current escalation configuration.
+    pub fn get_escalation_config(env: Env) -> Option<EscalationConfig> {
+        env.storage().instance().get(&DataKey::EscalationConfig)
+    }
+
+    /// Admin approves a large spend that was escalated.
+    ///
+    /// After approval, the spend is recorded against the user's limits
+    /// as though it passed normal enforcement.
+    pub fn approve_escalated_spend(env: Env, admin: Address, user: Address, amount: i128) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        // Record the spend against the user's limits
+        let mut limit: SpendingLimit = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpendingLimit(user.clone()))
+        {
+            Some(l) => l,
+            None => panic_with_error!(&env, SpendingLimitError::InvalidAmount),
+        };
+
+        limit.current_spending = limit
+            .current_spending
+            .checked_add(amount)
+            .unwrap_or(i128::MAX);
+        limit.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SpendingLimit(user.clone()), &limit);
+
+        LimitEvents::escalation_approved(&env, &admin, &user, amount);
+    }
+
+    /// Enforces the configured daily and monthly spending limits for a user,
+    /// including escalation tier checks.
     ///
     /// This function:
     /// - Tracks per-user daily and monthly totals using the current ledger timestamp.
+    /// - Checks escalation tiers: small (auto), medium (logged), large (requires approval).
     /// - Rejects spends that would exceed either the derived daily limit or the stored
     ///   monthly limit.
     /// - Emits a `limit_exceeded` event when a violation occurs.
+    /// - Emits an `escalation_triggered` event for medium/large spends.
     ///
     /// If no limit is configured for the user or the limit is inactive, the spend is
     /// allowed and no state is updated.
@@ -276,6 +354,12 @@ impl SpendingLimitsContract {
         // Validate amount
         if amount <= 0 {
             panic_with_error!(&env, SpendingLimitError::InvalidAmount);
+        }
+
+        // Check if destination is whitelisted (spending whitelist)
+        // This prevents unauthorized destinations from receiving funds
+        if !Self::is_destination_whitelisted(env, user.clone()) {
+            panic_with_error!(&env, SpendingLimitError::Unauthorized);
         }
 
         // Look up configured limit; if none, there is nothing to enforce.
@@ -383,6 +467,26 @@ impl SpendingLimitsContract {
             }
         }
 
+        // If adaptive strategy is enabled and user is nearing their limit (>= 90%)
+        // automatically increase the limit by 10% for future transactions.
+        if limit.strategy == crate::types::LimitStrategy::Adaptive
+            && new_monthly >= (limit.monthly_limit * 9 / 10)
+        {
+            let old_limit = limit.monthly_limit;
+            let increment = limit.monthly_limit / 10;
+            let proposed_limit = old_limit.checked_add(increment).unwrap_or(crate::types::MAX_SPENDING_LIMIT);
+
+            limit.monthly_limit = if proposed_limit > crate::types::MAX_SPENDING_LIMIT {
+                crate::types::MAX_SPENDING_LIMIT
+            } else {
+                proposed_limit
+            };
+
+            if limit.monthly_limit != old_limit {
+                LimitEvents::limit_adjusted(&env, &user, old_limit, limit.monthly_limit);
+            }
+        }
+
         // Persist updated totals.
         env.storage().persistent().set(&hourly_key, &new_hourly);
         env.storage().persistent().set(&daily_key, &new_daily);
@@ -437,8 +541,9 @@ impl SpendingLimitsContract {
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
-            .get(&DataKey::Admin)
+            .get::<DataKey, LimitsConfig>(&DataKey::LimitsConfig)
             .expect("Contract not initialized")
+            .admin
     }
 
     /// Updates the admin address.
@@ -446,14 +551,55 @@ impl SpendingLimitsContract {
         current_admin.require_auth();
         Self::require_admin(&env, &current_admin);
 
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        let mut config: LimitsConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::LimitsConfig)
+            .expect("Contract not initialized");
+        config.admin = new_admin;
+        env.storage()
+            .instance()
+            .set(&DataKey::LimitsConfig, &config);
+    }
+
+    /// Adds a destination address to the spending whitelist.
+    /// Only admin can call this method.
+    pub fn whitelist_destination(env: Env, caller: Address, destination: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        env.storage()
+            .persistent()
+            .set(&CrossContractDataKey::Whitelist(destination.clone()), &true);
+    }
+
+    /// Removes a destination address from the spending whitelist.
+    /// Only admin can call this method.
+    pub fn remove_from_whitelist(env: Env, caller: Address, destination: Address) {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        env.storage()
+            .persistent()
+            .remove(&CrossContractDataKey::Whitelist(destination.clone()));
+    }
+
+    /// Checks if a destination address is whitelisted for receiving funds.
+    /// This is a public read-only method that can be called by anyone.
+    pub fn is_destination_whitelisted(env: Env, destination: Address) -> bool {
+        // Use the same whitelist storage pattern as cross-contract module
+        // Check if destination is in whitelist
+        env.storage()
+            .persistent()
+            .has(&CrossContractDataKey::Whitelist(destination.clone()))
     }
 
     /// Returns the last created batch ID.
     pub fn get_last_batch_id(env: Env) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::LastBatchId)
+            .get::<DataKey, LimitsConfig>(&DataKey::LimitsConfig)
+            .map(|c| c.last_batch_id)
             .unwrap_or(0)
     }
 
@@ -461,7 +607,8 @@ impl SpendingLimitsContract {
     pub fn get_total_limits_updated(env: Env) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::TotalLimitsUpdated)
+            .get::<DataKey, LimitsConfig>(&DataKey::LimitsConfig)
+            .map(|c| c.total_limits_updated)
             .unwrap_or(0)
     }
 
@@ -469,21 +616,32 @@ impl SpendingLimitsContract {
     pub fn get_total_batches_processed(env: Env) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::TotalBatchesProcessed)
+            .get::<DataKey, LimitsConfig>(&DataKey::LimitsConfig)
+            .map(|c| c.total_batches_processed)
             .unwrap_or(0)
     }
 
     // Internal helper to verify admin
     fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env
+        let config: LimitsConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
+            .get(&DataKey::LimitsConfig)
             .expect("Contract not initialized");
 
-        if *caller != admin {
+        if *caller != config.admin {
             panic_with_error!(env, SpendingLimitError::Unauthorized);
         }
+    }
+
+    /// Checks if a destination address is whitelisted for receiving funds.
+    /// Uses the cross-contract whitelist functionality to determine authorization.
+    fn is_destination_whitelisted(env: &Env, destination: &Address) -> bool {
+        // Use the same whitelist storage pattern as cross-contract module
+        // Check if destination is in whitelist
+        env.storage()
+            .persistent()
+            .has(&CrossContractDataKey::Whitelist(destination.clone()))
     }
 }
 

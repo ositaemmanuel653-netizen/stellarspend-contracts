@@ -3,12 +3,8 @@
 use soroban_sdk::Address;
 
 use crate::types::{
-    ErrorCode,
-    SpendingLimitRequest,
-    MAX_RESET_WINDOW_SECONDS,
-    MAX_SPENDING_LIMIT,
-    MIN_RESET_WINDOW_SECONDS,
-    MIN_SPENDING_LIMIT,
+    ErrorCode, SpendingLimitRequest, MAX_RESET_WINDOW_SECONDS, MAX_SPENDING_LIMIT,
+    MIN_RESET_WINDOW_SECONDS, MIN_SPENDING_LIMIT,
 };
 
 /// Validates a spending limit update request.
@@ -94,6 +90,7 @@ mod tests {
             hourly_limit: monthly_limit / 30 / 24,
             reset_window_seconds: MIN_RESET_WINDOW_SECONDS,
             category: Some(symbol_short!("general")),
+            strategy: crate::types::LimitStrategy::Static,
         }
     }
 
