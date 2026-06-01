@@ -1,5 +1,8 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
+
+/// Maximum number of user-limit pairs in a single batch for optimization.
 /// Maximum number of requests in a single batch for optimization.
 pub const MAX_BATCH_SIZE: u32 = 100;
 
@@ -154,6 +157,20 @@ pub struct BatchLimitResult {
     pub metrics: BatchLimitMetrics,
 }
 
+/// Represents a spending limit exception granted to a user for a specific approved category.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ExceptionRule {
+    /// User address granted the exception
+    pub user: Address,
+    /// The approved category for which spending limits are bypassed
+    pub category: Symbol,
+    /// Ledger sequence when the exception was created
+    pub created_at: u64,
+    /// Whether the exception is currently active
+    pub is_active: bool,
+}
+
 /// Storage keys for contract state.
 #[derive(Clone)]
 #[contracttype]
@@ -170,6 +187,12 @@ pub enum DataKey {
     HourlySpending(Address, u64),
     /// Per-user daily spending for a given logical day identifier.
     DailySpending(Address, u64),
+    /// Per-user monthly spending for a given logical month identifier.
+    MonthlySpending(Address, u64),
+    /// Exception rule for a specific user+category pair
+    ExceptionRule(Address, Symbol),
+    /// Admin-approved categories eligible for exception rules
+    ApprovedCategories,
     /// Escalation configuration.
     EscalationConfig,
 }
@@ -180,6 +203,16 @@ pub mod ErrorCode {
     pub const INVALID_LIMIT: u32 = 0;
     /// Invalid user address
     pub const INVALID_USER_ADDRESS: u32 = 1;
+    /// Category name is invalid
+    pub const INVALID_CATEGORY: u32 = 2;
+    /// Limit already exists and cannot be overwritten
+    pub const LIMIT_ALREADY_EXISTS: u32 = 3;
+    /// Exception rule not found for user+category pair
+    pub const EXCEPTION_NOT_FOUND: u32 = 4;
+    /// Category is not in the approved categories list
+    pub const CATEGORY_NOT_APPROVED: u32 = 5;
+    /// Exception rule already exists for this user+category pair
+    pub const EXCEPTION_ALREADY_EXISTS: u32 = 6;
     /// Invalid reset window
     pub const INVALID_RESET_WINDOW: u32 = 2;
     /// Limit not found
@@ -290,5 +323,35 @@ impl LimitEvents {
                 new_limit,
             ),
         );
+    }
+
+    /// Event emitted when an exception rule is granted to a user for a category.
+    pub fn exception_added(env: &Env, user: &Address, category: &Symbol) {
+        let topics = (symbol_short!("exception"), symbol_short!("added"));
+        env.events().publish(topics, (user.clone(), category.clone()));
+    }
+
+    /// Event emitted when an exception rule is removed for a user+category pair.
+    pub fn exception_removed(env: &Env, user: &Address, category: &Symbol) {
+        let topics = (symbol_short!("exception"), symbol_short!("removed"));
+        env.events().publish(topics, (user.clone(), category.clone()));
+    }
+
+    /// Event emitted when a transaction bypasses spending limits via an active exception rule.
+    pub fn exception_bypassed(env: &Env, user: &Address, amount: i128, category: &Symbol) {
+        let topics = (symbol_short!("exception"), symbol_short!("bypass"));
+        env.events().publish(topics, (user.clone(), amount, category.clone()));
+    }
+
+    /// Event emitted when an approved category is added to the exception allow-list.
+    pub fn approved_category_added(env: &Env, category: &Symbol) {
+        let topics = (symbol_short!("category"), symbol_short!("approved"));
+        env.events().publish(topics, category.clone());
+    }
+
+    /// Event emitted when an approved category is removed from the exception allow-list.
+    pub fn approved_category_removed(env: &Env, category: &Symbol) {
+        let topics = (symbol_short!("category"), symbol_short!("removed"));
+        env.events().publish(topics, category.clone());
     }
 }

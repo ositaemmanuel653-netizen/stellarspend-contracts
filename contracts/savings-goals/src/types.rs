@@ -225,6 +225,8 @@ pub enum DataKey {
     GoalMilestonesPercent(u64),
     /// Total milestones achieved lifetime
     TotalMilestonesAchieved,
+    /// Ledger sequence at which a goal was automatically closed
+    GoalClosedAt(u64),
     /// Maps (user, goal_name) -> goal_id for duplicate detection
     GoalByName(Address, Symbol),
 }
@@ -253,6 +255,10 @@ pub mod ErrorCode {
     pub const UNAUTHORIZED_USER: u32 = 8;
     /// Goal has already achieved this milestone
     pub const MILESTONE_ALREADY_ACHIEVED: u32 = 9;
+    /// Goal is closed (target met) and no longer accepts contributions
+    pub const GOAL_CLOSED: u32 = 11;
+    /// Contribution amount is invalid (zero or negative)
+    pub const INVALID_CONTRIBUTION_AMOUNT: u32 = 12;
     /// Duplicate goal name for the same user
     pub const DUPLICATE_GOAL_NAME: u32 = 11;
     /// Goal is locked; withdrawals not yet allowed
@@ -385,6 +391,11 @@ impl GoalEvents {
             .publish(topics, (batch_id, successful, failed, total_percentage));
     }
 
+    /// Event emitted when a goal is automatically closed because the target amount was reached.
+    pub fn goal_closed(env: &Env, goal_id: u64, user: &Address, final_amount: i128, closed_at: u64) {
+        let topics = (symbol_short!("goal"), symbol_short!("closed"), goal_id);
+        env.events()
+            .publish(topics, (goal_id, user.clone(), final_amount, closed_at));
     /// Event emitted when a savings goal target is reached (completed).
     pub fn goal_completed(env: &Env, goal_id: u64, user: &Address, target_amount: i128) {
         let topics = (
