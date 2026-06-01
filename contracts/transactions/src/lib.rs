@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, String, Symbol, Vec,
+    Env, Map, String, Symbol, Vec,
 };
 
 mod storage;
@@ -10,10 +10,10 @@ mod utils;
 
 pub use storage::{
     clear_user_transactions, create_transaction, get_all_transactions, get_last_transaction,
-    get_total_transactions_count, get_transaction, get_transaction_memo, get_transaction_timestamp,
-    get_transactions_paginated, get_user_transactions, get_user_transactions_filtered,
-    is_transaction_owner, transaction_exists, update_transaction_status, Transaction,
-    TransactionStatus,
+    get_total_transactions_count, get_transaction, get_transaction_memo, get_transaction_metadata,
+    get_transaction_timestamp, get_transactions_paginated, get_user_transactions,
+    get_user_transactions_filtered, is_transaction_owner, set_transaction_metadata,
+    transaction_exists, update_transaction_status, Transaction, TransactionStatus,
 };
 
 #[cfg(test)]
@@ -71,6 +71,7 @@ impl TransactionsContract {
         tags: Vec<String>,
         tx_type: Symbol,
         is_public: bool,
+        metadata: Map<Symbol, String>,
     ) -> Symbol {
         from.require_auth();
 
@@ -101,6 +102,7 @@ impl TransactionsContract {
             tags,
             tx_type,
             is_public,
+            metadata,
         );
 
         env.events().publish(
@@ -115,6 +117,35 @@ impl TransactionsContract {
         );
 
         transaction.id
+    }
+
+    /// Set (replace) the metadata key-value pairs for an existing transaction.
+    /// Only the transaction owner can update metadata.
+    pub fn set_metadata(
+        env: Env,
+        id: Symbol,
+        caller: Address,
+        metadata: Map<Symbol, String>,
+    ) -> bool {
+        caller.require_auth();
+
+        if !transaction_exists(&env, id.clone()) {
+            panic_with_error!(&env, TransactionError::TransactionNotFound);
+        }
+
+        let success = storage::set_transaction_metadata(&env, id.clone(), caller, metadata);
+
+        if success {
+            env.events()
+                .publish((symbol_short!("tx"), symbol_short!("meta_set")), id);
+        }
+
+        success
+    }
+
+    /// Get the metadata key-value pairs for a transaction.
+    pub fn get_metadata(env: Env, id: Symbol) -> Option<Map<Symbol, String>> {
+        storage::get_transaction_metadata(&env, id)
     }
 
     /// Update the note attached to a transaction (only transaction owner can update)
