@@ -253,7 +253,7 @@ pub fn clear_user_transactions(env: &Env, user: Address) -> bool {
         .unwrap_or_else(|| Vec::new(env));
 
     // Get current all transactions
-    let mut all_txs: Vec<Symbol> = env
+    let all_txs: Vec<Symbol> = env
         .storage()
         .persistent()
         .get(&DataKey::AllTransactions)

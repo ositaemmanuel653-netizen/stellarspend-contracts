@@ -34,7 +34,7 @@ pub enum TransactionError {
     DuplicateTransaction = 9,
 }
 
-const MAX_NOTE_LENGTH: usize = 256;
+const MAX_NOTE_LENGTH: u32 = 256;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,7 +82,7 @@ impl TransactionsContract {
             panic_with_error!(&env, TransactionError::InvalidAmount);
         }
 
-        if note.len() > MAX_NOTE_LENGTH {
+        if note.len() as u32 > MAX_NOTE_LENGTH {
             panic_with_error!(&env, TransactionError::InvalidNoteLength);
         }
 
@@ -121,7 +121,7 @@ impl TransactionsContract {
     pub fn update_transaction_note(env: Env, id: Symbol, caller: Address, note: String) -> bool {
         caller.require_auth();
 
-        if note.len() > MAX_NOTE_LENGTH {
+        if note.len() as u32 > MAX_NOTE_LENGTH {
             panic_with_error!(&env, TransactionError::InvalidNoteLength);
         }
 
@@ -306,7 +306,7 @@ impl TransactionsContract {
 
         if success {
             env.events().publish(
-                (symbol_short!("tx"), symbol_short!("status_upd")),
+                (symbol_short!("tx"), symbol_short!("tx_status")),
                 (id.clone(), status),
             );
         }
